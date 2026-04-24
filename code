@@ -1,0 +1,922 @@
+from __future__ import annotations
+
+from pathlib import Path
+import re
+import json
+
+import mne
+import numpy as np
+import pandas as pd
+from scipy.signal import hilbert, resample_poly
+from scipy import stats
+
+# =============================
+# settings
+# =============================
+RAW_DATA_DIR = Path.home() / "Desktop" / "ds003478"
+PREPROC_DIR = Path.home() / "Desktop" / "ds003478_preproc_all"
+OUT_DIR = Path.home() / "Desktop" / "eeg_latent_bilateral_preproc_output"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+RUNS = ["run-01", "run-02"]
+
+CONTROL_BDI_CUTOFF = 7
+DEP_BDI_CUTOFF = 13
+
+K = 3
+MAX_SELECTED_PAIRS = 24
+
+ALPHA_LOW = 8.0
+ALPHA_HIGH = 12.0
+ENVELOPE_FS = 5.0
+WINDOW_SEC = 20.0
+MAX_LAG = 5
+
+QC_MIN_WINDOWS = 8
+QC_MAX_BAD_CHANNELS = 20
+
+PAIR_MAP = {1: 2, 3: 4, 5: 6, 7: 8, 9: 10}
+
+
+# =============================
+# basic helpers
+# =============================
+def compute_acf_at_lag(x: np.ndarray, lag: int) -> float:
+    x = np.asarray(x, dtype=float)
+    if len(x) <= lag + 1:
+        return np.nan
+    x = x - np.nanmean(x)
+    s = np.nanstd(x)
+    if s == 0 or np.isnan(s):
+        return np.nan
+    return float(np.corrcoef(x[:-lag], x[lag:])[0, 1])
+
+
+def compute_ac1(x: np.ndarray) -> float:
+    return compute_acf_at_lag(x, 1)
+
+
+def compute_lowfreq_fraction(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    if len(x) < 8:
+        return np.nan
+
+    x = x - np.nanmean(x)
+    p = np.abs(np.fft.rfft(x)) ** 2
+
+    if len(p) <= 2:
+        return np.nan
+
+    p = p[1:]  # remove zero frequency
+    total = np.nansum(p)
+
+    if total <= 0 or np.isnan(total):
+        return np.nan
+
+    n_low = max(1, len(p) // 4)
+    return float(np.nansum(p[:n_low]) / total)
+
+
+def fit_ar1_phi_sigma(x: np.ndarray):
+    x = np.asarray(x, dtype=float)
+    if len(x) < 4:
+        return np.nan, np.nan, np.nan
+
+    x = x - np.nanmean(x)
+    denom = np.nansum(x[:-1] ** 2)
+
+    if denom <= 0 or np.isnan(denom):
+        return np.nan, np.nan, np.nan
+
+    phi = float(np.nansum(x[:-1] * x[1:]) / denom)
+    resid = x[1:] - phi * x[:-1]
+
+    sigma_eps = float(np.nanstd(resid, ddof=1)) if len(resid) > 1 else np.nan
+    signal_std = float(np.nanstd(x, ddof=1)) if len(x) > 1 else np.nan
+
+    return phi, sigma_eps, signal_std
+
+
+def downsample_signal(x: np.ndarray, sfreq: float, target_fs: float) -> np.ndarray:
+    if np.isclose(sfreq, target_fs):
+        return x
+
+    from math import gcd
+
+    sf_int = int(round(sfreq))
+    tf_int = int(round(target_fs))
+    g = gcd(sf_int, tf_int)
+
+    up = tf_int // g
+    down = sf_int // g
+
+    return resample_poly(x, up=up, down=down, axis=-1)
+
+
+def get_eeg_channel_names(raw: mne.io.BaseRaw) -> list[str]:
+    picks = mne.pick_types(
+        raw.info,
+        eeg=True,
+        eog=False,
+        ecg=False,
+        emg=False,
+        misc=False,
+        stim=False,
+        exclude=[],
+    )
+    return [raw.ch_names[p] for p in picks]
+
+
+def read_participants() -> pd.DataFrame:
+    p = RAW_DATA_DIR / "participants.tsv"
+    df = pd.read_csv(p, sep="\t")
+
+    if "SCID_notes" in df.columns:
+        df = df[
+            ~df["SCID_notes"]
+            .astype(str)
+            .str.contains("INVALID PARTICIPANT", case=False, na=False)
+        ].copy()
+
+    return df
+
+
+def find_preproc_fif(subject: str, run: str) -> Path:
+    return PREPROC_DIR / subject / f"{subject}_task-Rest_{run}_preproc_raw.fif"
+
+
+def find_ec_windows(subject: str, run: str) -> Path:
+    return PREPROC_DIR / subject / f"{subject}_task-Rest_{run}_ec_windows_20s.csv"
+
+
+def find_qc_json(subject: str, run: str) -> Path:
+    return PREPROC_DIR / subject / f"{subject}_task-Rest_{run}_preproc_qc.json"
+
+
+def load_qc_summary() -> pd.DataFrame:
+    p = PREPROC_DIR / "all_subjects_preproc_summary.csv"
+    if p.exists():
+        return pd.read_csv(p)
+    return pd.DataFrame()
+
+
+# =============================
+# homologous pair construction
+# =============================
+def build_homologous_pairs(common_channels: list[str]) -> list[tuple[str, str]]:
+    upper_to_actual = {ch.upper(): ch for ch in common_channels}
+    pairs = []
+
+    for ch in common_channels:
+        m = re.match(r"^([A-Za-z]+)(\d+)$", ch)
+        if m is None:
+            continue
+
+        prefix = m.group(1)
+        num = int(m.group(2))
+
+        if num not in PAIR_MAP:
+            continue
+
+        partner_num = PAIR_MAP[num]
+        partner_key = f"{prefix}{partner_num}".upper()
+
+        if partner_key in upper_to_actual:
+            pairs.append((ch, upper_to_actual[partner_key]))
+
+    seen = set()
+    unique_pairs = []
+
+    for left, right in pairs:
+        key = (left.upper(), right.upper())
+        if key not in seen:
+            seen.add(key)
+            unique_pairs.append((left, right))
+
+    return unique_pairs
+
+
+def determine_common_channels(subjects: list[str]) -> list[str]:
+    channel_sets = []
+    first_order = None
+
+    for subject in subjects:
+        for run in RUNS:
+            fif = find_preproc_fif(subject, run)
+            if not fif.exists():
+                continue
+
+            try:
+                raw = mne.io.read_raw_fif(fif, preload=False, verbose="ERROR")
+                eeg_names = get_eeg_channel_names(raw)
+
+                if first_order is None:
+                    first_order = eeg_names
+
+                channel_sets.append(set(eeg_names))
+
+            except Exception:
+                continue
+
+    if len(channel_sets) == 0:
+        raise RuntimeError("No readable preprocessed FIF files found.")
+
+    common_set = set.intersection(*channel_sets)
+    common_channels = [ch for ch in first_order if ch in common_set]
+
+    return common_channels
+
+
+# =============================
+# extracting pair-difference windows
+# =============================
+def extract_run_pair_difference_windows(
+    subject: str,
+    run: str,
+    common_channels: list[str],
+    pair_list: list[tuple[str, str]],
+):
+    fif = find_preproc_fif(subject, run)
+    win_csv = find_ec_windows(subject, run)
+
+    if not fif.exists():
+        raise FileNotFoundError(f"Missing preprocessed FIF: {fif}")
+    if not win_csv.exists():
+        raise FileNotFoundError(f"Missing EC window CSV: {win_csv}")
+
+    windows_df = pd.read_csv(win_csv)
+    if len(windows_df) == 0:
+        raise ValueError("No EC windows available.")
+
+    raw = mne.io.read_raw_fif(fif, preload=True, verbose="ERROR")
+
+    missing = [ch for ch in common_channels if ch not in raw.ch_names]
+    if missing:
+        raise ValueError(f"Missing common channels: {missing[:5]}")
+
+    raw.pick(common_channels)
+    raw.filter(ALPHA_LOW, ALPHA_HIGH, fir_design="firwin", verbose="ERROR")
+
+    sfreq = float(raw.info["sfreq"])
+
+    env_windows = []
+    meta_rows = []
+
+    for wi, row in windows_df.iterrows():
+        start_sec = float(row["start_sec"])
+        end_sec = float(row["end_sec"])
+
+        start_sample = int(round(start_sec * sfreq))
+        end_sample = int(round(end_sec * sfreq))
+
+        start_sample = max(start_sample, 0)
+        end_sample = min(end_sample, raw.n_times)
+
+        if end_sample <= start_sample:
+            continue
+
+        data = raw.get_data(start=start_sample, stop=end_sample)
+
+        if data.shape[1] < 10:
+            continue
+
+        analytic = hilbert(data, axis=1)
+        env = np.abs(analytic)
+        env_ds = downsample_signal(env, sfreq=sfreq, target_fs=ENVELOPE_FS)
+
+        expected_n = int(round(WINDOW_SEC * ENVELOPE_FS))
+
+        if env_ds.shape[1] < expected_n:
+            continue
+
+        env_ds = env_ds[:, :expected_n]
+
+        env_windows.append(env_ds.astype(np.float32))
+        meta_rows.append({
+            "subject": subject,
+            "run": run,
+            "window_index": int(wi + 1),
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+            "n_timepoints": int(env_ds.shape[1]),
+        })
+
+    if len(env_windows) == 0:
+        raise ValueError("No valid envelope windows after extraction.")
+
+    # Run-level channel z-score across all EC windows.
+    env_all = np.concatenate(env_windows, axis=1)
+    mu = env_all.mean(axis=1, keepdims=True)
+    sd = env_all.std(axis=1, keepdims=True)
+    sd[sd == 0] = 1.0
+
+    ch_index = {ch: i for i, ch in enumerate(common_channels)}
+
+    D_windows = []
+
+    for env in env_windows:
+        z = (env - mu) / sd
+
+        D = np.column_stack([
+            z[ch_index[left], :] - z[ch_index[right], :]
+            for left, right in pair_list
+        ])
+
+        D_windows.append(D.astype(np.float32))
+
+    D_run = np.concatenate(D_windows, axis=0)
+
+    return D_windows, pd.DataFrame(meta_rows), D_run
+
+
+# =============================
+# control basis
+# =============================
+def fit_control_basis(
+    control_subjects: list[str],
+    common_channels: list[str],
+    pair_list: list[tuple[str, str]],
+):
+    control_runs = []
+
+    for subject in control_subjects:
+        for run in RUNS:
+            try:
+                D_windows, meta_df, D_run = extract_run_pair_difference_windows(
+                    subject,
+                    run,
+                    common_channels,
+                    pair_list,
+                )
+
+                control_runs.append({
+                    "subject": subject,
+                    "run": run,
+                    "D_run": D_run,
+                })
+
+                print(f"Control basis added: {subject} {run}, shape={D_run.shape}")
+
+            except Exception as e:
+                print(f"Control basis skipped: {subject} {run}: {e}")
+
+    if len(control_runs) == 0:
+        raise RuntimeError("No control runs available for basis fitting.")
+
+    pair_var_matrix = np.vstack([
+        np.var(item["D_run"], axis=0) for item in control_runs
+    ])
+
+    mean_pair_var = pair_var_matrix.mean(axis=0)
+
+    n_select = min(MAX_SELECTED_PAIRS, len(pair_list))
+    selected_idx = np.argsort(mean_pair_var)[::-1][:n_select]
+    selected_pairs = [pair_list[i] for i in selected_idx]
+
+    pd.DataFrame({
+        "pair_index": np.arange(len(selected_pairs)),
+        "left_channel": [p[0] for p in selected_pairs],
+        "right_channel": [p[1] for p in selected_pairs],
+        "mean_control_variance": mean_pair_var[selected_idx],
+    }).to_csv(OUT_DIR / "selected_homologous_pairs.csv", index=False)
+
+    X_hc = np.concatenate(
+        [item["D_run"][:, selected_idx] for item in control_runs],
+        axis=0,
+    ).astype(np.float32)
+
+    mu_pair = X_hc.mean(axis=0)
+    sd_pair = X_hc.std(axis=0)
+    sd_pair[sd_pair == 0] = 1.0
+
+    X_hat = (X_hc - mu_pair) / sd_pair
+
+    U, S, Vt = np.linalg.svd(X_hat, full_matrices=False)
+
+    B = Vt[:K].T
+    explained = (S ** 2) / np.sum(S ** 2)
+    explained_k = explained[:K]
+
+    load_df = pd.DataFrame({
+        "pair_index": np.arange(len(selected_pairs)),
+        "left_channel": [p[0] for p in selected_pairs],
+        "right_channel": [p[1] for p in selected_pairs],
+    })
+
+    for j in range(K):
+        load_df[f"PC{j+1}_loading"] = B[:, j]
+
+    load_df.to_csv(OUT_DIR / "control_pca_pair_loadings.csv", index=False)
+
+    pd.DataFrame({
+        "component": [f"PC{i+1}" for i in range(K)],
+        "explained_variance_ratio": explained_k,
+    }).to_csv(OUT_DIR / "control_pca_explained_variance.csv", index=False)
+
+    return selected_idx, selected_pairs, mu_pair, sd_pair, B, explained_k
+
+
+# =============================
+# metrics
+# =============================
+def compute_window_metrics(Zw: np.ndarray) -> dict:
+    pc_rows = []
+
+    lag1_vals = []
+    lowfreq_vals = []
+    phi_vals = []
+    sigma_vals = []
+    signal_std_vals = []
+    lag_profile = {lag: [] for lag in range(1, MAX_LAG + 1)}
+
+    for j in range(Zw.shape[1]):
+        ts = Zw[:, j]
+
+        lag1 = compute_ac1(ts)
+        lowfreq = compute_lowfreq_fraction(ts)
+        phi, sigma_eps, signal_std = fit_ar1_phi_sigma(ts)
+
+        lag1_vals.append(lag1)
+        lowfreq_vals.append(lowfreq)
+        phi_vals.append(phi)
+        sigma_vals.append(sigma_eps)
+        signal_std_vals.append(signal_std)
+
+        pc_row = {
+            "pc": f"PC{j+1}",
+            "lag1_autocorr": lag1,
+            "lowfreq_fraction": lowfreq,
+            "ar1_phi": phi,
+            "residual_sd": sigma_eps,
+            "latent_signal_sd": signal_std,
+        }
+
+        for lag in range(1, MAX_LAG + 1):
+            acf = compute_acf_at_lag(ts, lag)
+            lag_profile[lag].append(acf)
+            pc_row[f"acf_lag{lag}"] = acf
+
+        pc_rows.append(pc_row)
+
+    summary = {
+        "mean_lag1_autocorr": float(np.nanmean(lag1_vals)),
+        "lowfreq_fraction": float(np.nanmean(lowfreq_vals)),
+        "mean_ar1_phi": float(np.nanmean(phi_vals)),
+        "mean_residual_sd": float(np.nanmean(sigma_vals)),
+        "mean_latent_signal_sd": float(np.nanmean(signal_std_vals)),
+    }
+
+    for lag in range(1, MAX_LAG + 1):
+        summary[f"mean_acf_lag{lag}"] = float(np.nanmean(lag_profile[lag]))
+
+    return summary, pc_rows
+
+
+def compute_run_metrics(
+    subject: str,
+    run: str,
+    common_channels: list[str],
+    pair_list: list[tuple[str, str]],
+    selected_idx: np.ndarray,
+    selected_pairs: list[tuple[str, str]],
+    mu_pair: np.ndarray,
+    sd_pair: np.ndarray,
+    B: np.ndarray,
+):
+    D_windows, meta_df, D_run = extract_run_pair_difference_windows(
+        subject,
+        run,
+        common_channels,
+        pair_list,
+    )
+
+    window_rows = []
+    pc_rows_all = []
+    pair_rows_all = []
+
+    for wi, D in enumerate(D_windows):
+        D_sel = D[:, selected_idx]
+        Zw = ((D_sel - mu_pair) / sd_pair) @ B
+
+        win_summary, pc_rows = compute_window_metrics(Zw)
+
+        base = {
+            "subject": subject,
+            "run": run,
+            "window_index": int(wi + 1),
+        }
+
+        window_rows.append({**base, **win_summary})
+
+        for pc_row in pc_rows:
+            pc_rows_all.append({**base, **pc_row})
+
+        for pi, (left, right) in enumerate(selected_pairs):
+            ts = D_sel[:, pi]
+
+            pair_rows_all.append({
+                **base,
+                "pair_index": int(pi),
+                "left_channel": left,
+                "right_channel": right,
+                "pair_lag1_autocorr": compute_ac1(ts),
+                "pair_lowfreq_fraction": compute_lowfreq_fraction(ts),
+            })
+
+    window_df = pd.DataFrame(window_rows)
+    pc_df = pd.DataFrame(pc_rows_all)
+    pair_df = pd.DataFrame(pair_rows_all)
+
+    run_summary = {
+        "subject": subject,
+        "run": run,
+        "n_windows_used": int(len(window_df)),
+    }
+
+    for col in [
+        "mean_lag1_autocorr",
+        "lowfreq_fraction",
+        "mean_ar1_phi",
+        "mean_residual_sd",
+        "mean_latent_signal_sd",
+    ] + [f"mean_acf_lag{lag}" for lag in range(1, MAX_LAG + 1)]:
+        run_summary[col] = float(window_df[col].mean()) if col in window_df.columns else np.nan
+
+    return run_summary, window_df, pc_df, pair_df
+
+
+# =============================
+# statistics
+# =============================
+def cohens_d(hc, dep):
+    hc = np.asarray(hc, dtype=float)
+    dep = np.asarray(dep, dtype=float)
+
+    if len(hc) < 2 or len(dep) < 2:
+        return np.nan
+
+    sx = np.var(hc, ddof=1)
+    sy = np.var(dep, ddof=1)
+    pooled = np.sqrt(((len(hc) - 1) * sx + (len(dep) - 1) * sy) / (len(hc) + len(dep) - 2))
+
+    if pooled == 0:
+        return np.nan
+
+    return float((np.mean(dep) - np.mean(hc)) / pooled)
+
+
+def summarize_metric(df: pd.DataFrame, metric: str, analysis: str) -> dict:
+    use = df[
+        df["group"].isin(["HC", "DEP"]) &
+        df[metric].notna()
+    ].copy()
+
+    hc = use.loc[use["group"] == "HC", metric].values
+    dep = use.loc[use["group"] == "DEP", metric].values
+
+    row = {
+        "analysis": analysis,
+        "metric": metric,
+        "n_HC": len(hc),
+        "n_DEP": len(dep),
+        "mean_HC": np.mean(hc) if len(hc) else np.nan,
+        "mean_DEP": np.mean(dep) if len(dep) else np.nan,
+        "mean_diff_DEP_minus_HC": (np.mean(dep) - np.mean(hc)) if len(hc) and len(dep) else np.nan,
+        "cohens_d_DEP_minus_HC": cohens_d(hc, dep),
+    }
+
+    if len(hc) >= 2 and len(dep) >= 2:
+        welch = stats.ttest_ind(dep, hc, equal_var=False, nan_policy="omit")
+        mw = stats.mannwhitneyu(dep, hc, alternative="two-sided")
+
+        row["welch_t"] = float(welch.statistic)
+        row["welch_p"] = float(welch.pvalue)
+        row["mannwhitney_u"] = float(mw.statistic)
+        row["mannwhitney_p"] = float(mw.pvalue)
+
+        if "BDI" in use.columns:
+            pear = stats.pearsonr(use["BDI"].values.astype(float), use[metric].values.astype(float))
+            spear = stats.spearmanr(use["BDI"].values.astype(float), use[metric].values.astype(float))
+
+            row["pearson_r"] = float(pear.statistic)
+            row["pearson_p"] = float(pear.pvalue)
+            row["spearman_rho"] = float(spear.statistic)
+            row["spearman_p"] = float(spear.pvalue)
+
+    return row
+
+
+def ols_table(df: pd.DataFrame, y_col: str, x_cols: list[str], model_name: str) -> pd.DataFrame:
+    use = df.dropna(subset=[y_col] + x_cols).copy()
+
+    if len(use) == 0:
+        return pd.DataFrame()
+
+    y = use[y_col].values.astype(float)
+    X_parts = [np.ones(len(use))]
+    names = ["Intercept"]
+
+    for col in x_cols:
+        X_parts.append(use[col].values.astype(float))
+        names.append(col)
+
+    X = np.column_stack(X_parts)
+
+    beta = np.linalg.pinv(X.T @ X) @ (X.T @ y)
+    resid = y - X @ beta
+
+    n, p = X.shape
+    dof = n - p
+
+    if dof > 0:
+        sigma2 = float((resid @ resid) / dof)
+        cov = sigma2 * np.linalg.pinv(X.T @ X)
+        se = np.sqrt(np.diag(cov))
+        tvals = beta / se
+        pvals = 2 * (1 - stats.t.cdf(np.abs(tvals), df=dof))
+        partial_r2 = (tvals ** 2) / ((tvals ** 2) + dof)
+    else:
+        se = np.full_like(beta, np.nan)
+        tvals = np.full_like(beta, np.nan)
+        pvals = np.full_like(beta, np.nan)
+        partial_r2 = np.full_like(beta, np.nan)
+
+    return pd.DataFrame({
+        "model": model_name,
+        "outcome": y_col,
+        "term": names,
+        "coef": beta,
+        "se": se,
+        "t": tvals,
+        "p": pvals,
+        "partial_r2": partial_r2,
+        "n": n,
+        "dof": dof,
+    })
+
+
+# =============================
+# main
+# =============================
+def main():
+    participants = read_participants()
+    qc_subject = load_qc_summary()
+
+    subjects = participants["participant_id"].astype(str).tolist()
+
+    print("Determining common EEG channels...")
+    common_channels = determine_common_channels(subjects)
+    pd.DataFrame({"channel": common_channels}).to_csv(OUT_DIR / "common_eeg_channels.csv", index=False)
+
+    pair_list = build_homologous_pairs(common_channels)
+    if len(pair_list) == 0:
+        raise RuntimeError("No homologous pairs found.")
+
+    pd.DataFrame({
+        "left_channel": [p[0] for p in pair_list],
+        "right_channel": [p[1] for p in pair_list],
+    }).to_csv(OUT_DIR / "all_homologous_pairs.csv", index=False)
+
+    print("Common EEG channels:", len(common_channels))
+    print("Homologous pairs:", len(pair_list))
+
+    control_subjects = participants.loc[
+        participants["BDI"] < CONTROL_BDI_CUTOFF,
+        "participant_id"
+    ].astype(str).tolist()
+
+    print("Fitting control basis...")
+    selected_idx, selected_pairs, mu_pair, sd_pair, B, explained_k = fit_control_basis(
+        control_subjects,
+        common_channels,
+        pair_list,
+    )
+
+    print("Explained variance:", explained_k)
+
+    all_run_rows = []
+    all_window_rows = []
+    all_pc_rows = []
+    all_pair_rows = []
+    all_error_rows = []
+
+    for si, subject in enumerate(subjects, start=1):
+        print(f"\n=== Subject {si}/{len(subjects)}: {subject} ===")
+
+        for run in RUNS:
+            try:
+                run_summary, win_df, pc_df, pair_df = compute_run_metrics(
+                    subject,
+                    run,
+                    common_channels,
+                    pair_list,
+                    selected_idx,
+                    selected_pairs,
+                    mu_pair,
+                    sd_pair,
+                    B,
+                )
+
+                all_run_rows.append(run_summary)
+                all_window_rows.extend(win_df.to_dict(orient="records"))
+                all_pc_rows.extend(pc_df.to_dict(orient="records"))
+                all_pair_rows.extend(pair_df.to_dict(orient="records"))
+
+                print(
+                    f"{run}: lag1={run_summary['mean_lag1_autocorr']:.4f}, "
+                    f"lf={run_summary['lowfreq_fraction']:.4f}, "
+                    f"windows={run_summary['n_windows_used']}"
+                )
+
+            except Exception as e:
+                msg = str(e)
+                print(f"{run}: ERROR: {msg}")
+                all_error_rows.append({
+                    "subject": subject,
+                    "run": run,
+                    "error": msg,
+                })
+
+    run_df = pd.DataFrame(all_run_rows)
+    window_df = pd.DataFrame(all_window_rows)
+    pc_window_df = pd.DataFrame(all_pc_rows)
+    pair_window_df = pd.DataFrame(all_pair_rows)
+    error_df = pd.DataFrame(all_error_rows)
+
+    run_df.to_csv(OUT_DIR / "all_runs_latent_bilateral_preproc.csv", index=False)
+    window_df.to_csv(OUT_DIR / "all_windows_latent_bilateral_preproc.csv", index=False)
+    pc_window_df.to_csv(OUT_DIR / "all_windows_pc_latent_preproc.csv", index=False)
+    pair_window_df.to_csv(OUT_DIR / "all_windows_pair_metrics_preproc.csv", index=False)
+    error_df.to_csv(OUT_DIR / "all_errors_latent_bilateral_preproc.csv", index=False)
+
+    # Subject-level aggregation
+    subject_df = (
+        run_df.groupby("subject", as_index=False)
+        .mean(numeric_only=True)
+    )
+
+    subject_df["n_runs_used"] = (
+        run_df.groupby("subject")["run"]
+        .count()
+        .reindex(subject_df["subject"])
+        .values
+    )
+
+    used_runs = (
+        run_df.groupby("subject")["run"]
+        .apply(lambda x: ";".join(x.astype(str)))
+        .reset_index(name="used_runs")
+    )
+    subject_df = subject_df.merge(used_runs, on="subject", how="left")
+
+    meta_cols = ["participant_id", "BDI", "STAI", "SCID", "HamD", "sex", "age"]
+    available_meta_cols = [c for c in meta_cols if c in participants.columns]
+    subject_df = subject_df.merge(
+        participants[available_meta_cols],
+        left_on="subject",
+        right_on="participant_id",
+        how="left",
+    )
+
+    if "participant_id" in subject_df.columns:
+        subject_df = subject_df.drop(columns=["participant_id"])
+
+    if len(qc_subject) > 0:
+        subject_df = subject_df.merge(qc_subject, on="subject", how="left")
+
+    subject_df["group"] = np.where(
+        subject_df["BDI"] < CONTROL_BDI_CUTOFF,
+        "HC",
+        np.where(subject_df["BDI"] >= DEP_BDI_CUTOFF, "DEP", "MID"),
+    )
+
+    subject_df.to_csv(OUT_DIR / "all_subjects_latent_bilateral_preproc.csv", index=False)
+
+    # PC subject-level
+    pc_subject_df = (
+        pc_window_df.groupby(["subject", "pc"], as_index=False)
+        .mean(numeric_only=True)
+    )
+    pc_subject_df = pc_subject_df.merge(
+        subject_df[["subject", "BDI", "group", "n_runs_used", "total_ec_windows_20s", "total_detected_bad_channels"]],
+        on="subject",
+        how="left",
+    )
+    pc_subject_df.to_csv(OUT_DIR / "all_subjects_pc_latent_preproc.csv", index=False)
+
+    # Pair subject-level
+    pair_subject_df = (
+        pair_window_df.groupby(["subject", "pair_index", "left_channel", "right_channel"], as_index=False)
+        .mean(numeric_only=True)
+    )
+    pair_subject_df = pair_subject_df.merge(
+        subject_df[["subject", "BDI", "group", "n_runs_used", "total_ec_windows_20s", "total_detected_bad_channels"]],
+        on="subject",
+        how="left",
+    )
+    pair_subject_df.to_csv(OUT_DIR / "all_subjects_pair_metrics_preproc.csv", index=False)
+
+    # Stats
+    metric_cols = [
+        "mean_lag1_autocorr",
+        "lowfreq_fraction",
+        "mean_ar1_phi",
+        "mean_residual_sd",
+        "mean_latent_signal_sd",
+    ] + [f"mean_acf_lag{lag}" for lag in range(1, MAX_LAG + 1)]
+
+    stats_rows = []
+
+    inclusion_sets = {
+        "main_all_usable": subject_df[subject_df["n_runs_used"] >= 1].copy(),
+        "sensitivity_two_runs": subject_df[subject_df["n_runs_used"] == 2].copy(),
+        "sensitivity_qc_strict": subject_df[
+            (subject_df["n_runs_used"] == 2) &
+            (subject_df["total_ec_windows_20s"] >= QC_MIN_WINDOWS) &
+            (subject_df["total_detected_bad_channels"] <= QC_MAX_BAD_CHANNELS)
+        ].copy(),
+    }
+
+    for analysis_name, df_use in inclusion_sets.items():
+        for metric in metric_cols:
+            if metric in df_use.columns:
+                stats_rows.append(summarize_metric(df_use, metric, analysis_name))
+
+    stats_df = pd.DataFrame(stats_rows)
+    stats_df.to_csv(OUT_DIR / "main_stats_preproc.csv", index=False)
+
+    # PC-specific stats
+    pc_stats = []
+    for pc in sorted(pc_subject_df["pc"].dropna().unique()):
+        df_pc = pc_subject_df[pc_subject_df["pc"] == pc].copy()
+        for metric in ["lag1_autocorr", "lowfreq_fraction", "ar1_phi", "residual_sd", "latent_signal_sd"]:
+            if metric in df_pc.columns:
+                row = summarize_metric(df_pc, metric, f"pc_specific_{pc}")
+                row["pc"] = pc
+                pc_stats.append(row)
+
+    pd.DataFrame(pc_stats).to_csv(OUT_DIR / "pc_specific_stats_preproc.csv", index=False)
+
+    # Pair-specific stats
+    pair_stats = []
+    for _, pmeta in pair_subject_df[["pair_index", "left_channel", "right_channel"]].drop_duplicates().iterrows():
+        df_pair = pair_subject_df[pair_subject_df["pair_index"] == pmeta["pair_index"]].copy()
+
+        for metric in ["pair_lag1_autocorr", "pair_lowfreq_fraction"]:
+            row = summarize_metric(df_pair, metric, "pair_specific")
+            row["pair_index"] = pmeta["pair_index"]
+            row["left_channel"] = pmeta["left_channel"]
+            row["right_channel"] = pmeta["right_channel"]
+            pair_stats.append(row)
+
+    pd.DataFrame(pair_stats).to_csv(OUT_DIR / "pair_specific_stats_preproc.csv", index=False)
+
+    # Noise-control regressions
+    reg_rows = []
+
+    reg_base = subject_df[
+        (subject_df["n_runs_used"] >= 1) &
+        (subject_df["group"].isin(["HC", "DEP"]))
+    ].copy()
+    reg_base["DEP_binary"] = (reg_base["group"] == "DEP").astype(int)
+
+    for analysis_name, df_reg in inclusion_sets.items():
+        df_reg = df_reg[df_reg["group"].isin(["HC", "DEP"])].copy()
+        df_reg["DEP_binary"] = (df_reg["group"] == "DEP").astype(int)
+
+        for outcome in ["mean_lag1_autocorr", "lowfreq_fraction"]:
+            reg_rows.append(
+                ols_table(
+                    df_reg,
+                    y_col=outcome,
+                    x_cols=["DEP_binary", "mean_residual_sd", "mean_latent_signal_sd", "total_ec_windows_20s"],
+                    model_name=f"{analysis_name}_{outcome}_group_plus_noise",
+                )
+            )
+
+            reg_rows.append(
+                ols_table(
+                    df_reg,
+                    y_col=outcome,
+                    x_cols=["BDI", "mean_residual_sd", "mean_latent_signal_sd", "total_ec_windows_20s"],
+                    model_name=f"{analysis_name}_{outcome}_bdi_plus_noise",
+                )
+            )
+
+    reg_out = pd.concat(reg_rows, ignore_index=True)
+    reg_out.to_csv(OUT_DIR / "noise_control_regressions_preproc.csv", index=False)
+
+    print("\n========== DONE ==========")
+    print("Saved:", OUT_DIR / "all_subjects_latent_bilateral_preproc.csv")
+    print("Saved:", OUT_DIR / "main_stats_preproc.csv")
+    print("Saved:", OUT_DIR / "pc_specific_stats_preproc.csv")
+    print("Saved:", OUT_DIR / "pair_specific_stats_preproc.csv")
+    print("Saved:", OUT_DIR / "noise_control_regressions_preproc.csv")
+    print("Saved:", OUT_DIR / "all_errors_latent_bilateral_preproc.csv")
+    print("Subjects analyzed:", len(subject_df))
+    print("Run rows:", len(run_df))
+    print("Errors:", len(error_df))
+
+
+if __name__ == "__main__":
+    main()
